@@ -20,6 +20,9 @@ namespace HandFilterApp
         private Task _cameraTask;
         private Task _detectionTask;
         private InferenceSession _palmDetector;
+        private InferenceSession _landmarkDetector;
+        private readonly object _landmarksLock = new object();
+        private OpenCvSharp.Point2f[] _lastLandmarks = null;
 
         public MainWindow()
         {
@@ -79,14 +82,22 @@ namespace HandFilterApp
             }
 
             OpenCvSharp.Rect? box;
-            lock (_boxLock)
-            {
-                box = _lastPalmBox;
-            }
+            lock (_boxLock) { box = _lastPalmBox; }
 
             if (box.HasValue)
             {
                 Cv2.Rectangle(frameCopy, box.Value, Scalar.LimeGreen, 3);
+            }
+
+            OpenCvSharp.Point2f[] landmarks;
+            lock (_landmarksLock) { landmarks = _lastLandmarks; }
+
+            if (landmarks != null)
+            {
+                foreach (var pt in landmarks)
+                {
+                    Cv2.Circle(frameCopy, (OpenCvSharp.Point)pt, 5, Scalar.Red, -1);
+                }
             }
 
             var bitmap = MatToBitmapSource(frameCopy);
@@ -113,10 +124,13 @@ namespace HandFilterApp
 
         private void LoadModels()
         {
-            string modelPath = System.IO.Path.Combine(
-        AppDomain.CurrentDomain.BaseDirectory, "Models", "palm_detection_mediapipe_2023feb.onnx");
+            string palmPath = System.IO.Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "Models", "palm_detection_mediapipe_2023feb.onnx");
+            _palmDetector = new InferenceSession(palmPath);
 
-            _palmDetector = new InferenceSession(modelPath);
+            string landmarkPath = System.IO.Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "Models", "handpose_estimation_mediapipe_2023feb.onnx");
+            _landmarkDetector = new InferenceSession(landmarkPath);
         }
 
         private Tensor<float> PreprocessFrame(Mat frame, out float padLeft, out float padTop, out float scale)
@@ -177,6 +191,19 @@ namespace HandFilterApp
                 if (frameCopy != null)
                 {
                     DetectPalm(frameCopy);
+
+                    OpenCvSharp.Rect? box;
+                    lock (_boxLock) { box = _lastPalmBox; }
+
+                    if (box.HasValue)
+                    {
+                        DetectLandmarks(frameCopy, box.Value);
+                    }
+                    else
+                    {
+                        lock (_landmarksLock) { _lastLandmarks = null; }
+                    }
+
                     frameCopy.Dispose();
                 }
                 else
@@ -290,6 +317,73 @@ namespace HandFilterApp
             }
 
             return anchors;
+        }
+
+        private void DetectLandmarks(Mat frame, OpenCvSharp.Rect palmBox)
+        {
+            int centerX = palmBox.X + palmBox.Width / 2;
+            int centerY = palmBox.Y + palmBox.Height / 2 - (int)(palmBox.Height * 0.1f);
+            int side = (int)(Math.Max(palmBox.Width, palmBox.Height) * 2.6f);
+
+            int cropX = centerX - side / 2;
+            int cropY = centerY - side / 2;
+
+            int x1 = Math.Max(0, cropX);
+            int y1 = Math.Max(0, cropY);
+            int x2 = Math.Min(frame.Width, cropX + side);
+            int y2 = Math.Min(frame.Height, cropY + side);
+
+            if (x2 - x1 <= 0 || y2 - y1 <= 0) return;
+
+            using var cropped = new Mat(frame, new OpenCvSharp.Rect(x1, y1, x2 - x1, y2 - y1));
+            using var rgb = new Mat();
+            Cv2.CvtColor(cropped, rgb, ColorConversionCodes.BGR2RGB);
+            using var resized = new Mat();
+            Cv2.Resize(rgb, resized, new OpenCvSharp.Size(224, 224));
+
+            var tensor = new DenseTensor<float>(new[] { 1, 224, 224, 3 });
+            for (int y = 0; y < 224; y++)
+            {
+                for (int x = 0; x < 224; x++)
+                {
+                    var pixel = resized.At<Vec3b>(y, x);
+                    tensor[0, y, x, 0] = pixel.Item0 / 255f;
+                    tensor[0, y, x, 1] = pixel.Item1 / 255f;
+                    tensor[0, y, x, 2] = pixel.Item2 / 255f;
+                }
+            }
+
+            var inputs = new List<NamedOnnxValue>
+    {
+        NamedOnnxValue.CreateFromTensor("input_1", tensor)
+    };
+
+            using var results = _landmarkDetector.Run(inputs);
+
+            float conf = results.First(r => r.Name == "Identity_1").AsTensor<float>().GetValue(0);
+            if (conf < 0.5f)
+            {
+                lock (_landmarksLock) { _lastLandmarks = null; }
+                return;
+            }
+
+            var raw = results.First(r => r.Name == "Identity").AsTensor<float>();
+
+            float scaleX = (float)(x2 - x1) / 224f;
+            float scaleY = (float)(y2 - y1) / 224f;
+
+            var points = new OpenCvSharp.Point2f[21];
+            for (int i = 0; i < 21; i++)
+            {
+                float lx = raw[0, i * 3];
+                float ly = raw[0, i * 3 + 1];
+                points[i] = new OpenCvSharp.Point2f(lx * scaleX + x1, ly * scaleY + y1);
+            }
+
+            lock (_landmarksLock)
+            {
+                _lastLandmarks = points;
+            }
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
