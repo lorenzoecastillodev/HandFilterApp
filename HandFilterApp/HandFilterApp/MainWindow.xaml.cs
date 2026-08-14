@@ -8,6 +8,7 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using System.Linq;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace HandFilterApp
 {
@@ -37,6 +38,21 @@ namespace HandFilterApp
             StartCamera();
         }
 
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        private void EnableDarkTitleBar()
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            int useDarkMode = 1;
+            DwmSetWindowAttribute(hwnd, 20, ref useDarkMode, sizeof(int));
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            EnableDarkTitleBar();
+        }
         private void StartCamera()
         {
             _capture = new VideoCapture(0);
@@ -477,13 +493,147 @@ namespace HandFilterApp
         (OpenCvSharp.Point)thumbLeft
     };
 
-            using var mask = Mat.Zeros(frame.Size(), MatType.CV_8UC1).ToMat();
-            Cv2.FillConvexPoly(mask, quad, Scalar.White);
+            var boundingRect = Cv2.BoundingRect(quad) & new OpenCvSharp.Rect(0, 0, frame.Width, frame.Height);
+            if (boundingRect.Width <= 0 || boundingRect.Height <= 0) return;
 
-            using var filtered = new Mat();
-            Cv2.BitwiseNot(frame, filtered);
+            using var roi = new Mat(frame, boundingRect);
+            using var mask = Mat.Zeros(roi.Size(), MatType.CV_8UC1).ToMat();
 
-            filtered.CopyTo(frame, mask);
+            var shiftedQuad = quad.Select(p => new OpenCvSharp.Point(p.X - boundingRect.X, p.Y - boundingRect.Y)).ToArray();
+            Cv2.FillConvexPoly(mask, shiftedQuad, Scalar.White);
+
+            using var filtered = ApplyFilterEffect(roi, _currentFilterIndex);
+            filtered.CopyTo(roi, mask);
+        }
+
+        //Filtros
+
+        private Mat HeatmapFilter(Mat src)
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+            var result = new Mat();
+            Cv2.ApplyColorMap(gray, result, ColormapTypes.Jet);
+            return result;
+        }
+
+        private Mat SketchFilter(Mat src)
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+            using var inverted = new Mat();
+            Cv2.BitwiseNot(gray, inverted);
+            using var blurred = new Mat();
+            Cv2.GaussianBlur(inverted, blurred, new OpenCvSharp.Size(21, 21), 0);
+            using var invertedBlur = new Mat();
+            Cv2.BitwiseNot(blurred, invertedBlur);
+            using var sketchGray = new Mat();
+            Cv2.Divide(gray, invertedBlur, sketchGray, 256.0);
+            var result = new Mat();
+            Cv2.CvtColor(sketchGray, result, ColorConversionCodes.GRAY2BGR);
+            return result;
+        }
+
+        private Mat PrismFilter(Mat src)
+        {
+            OpenCvSharp.Mat[] channels = Cv2.Split(src);
+
+            int shiftX = Math.Max(10, src.Width / 20);
+            int shiftY = Math.Max(3, src.Height / 100);
+
+            using var mB = new Mat(2, 3, MatType.CV_32F);
+            mB.Set(0, 0, 1f); mB.Set(0, 1, 0f); mB.Set(0, 2, -(float)shiftX);
+            mB.Set(1, 0, 0f); mB.Set(1, 1, 1f); mB.Set(1, 2, (float)shiftY);
+
+            using var mR = new Mat(2, 3, MatType.CV_32F);
+            mR.Set(0, 0, 1f); mR.Set(0, 1, 0f); mR.Set(0, 2, (float)shiftX);
+            mR.Set(1, 0, 0f); mR.Set(1, 1, 1f); mR.Set(1, 2, -(float)shiftY);
+
+            using var bShifted = new Mat();
+            using var rShifted = new Mat();
+
+            Cv2.WarpAffine(channels[0], bShifted, mB, src.Size(), InterpolationFlags.Linear, BorderTypes.Replicate);
+            Cv2.WarpAffine(channels[2], rShifted, mR, src.Size(), InterpolationFlags.Linear, BorderTypes.Replicate);
+
+            var result = new Mat();
+            Cv2.Merge(new[] { bShifted, channels[1], rShifted }, result);
+
+            channels[0].Dispose();
+            channels[1].Dispose();
+            channels[2].Dispose();
+
+            return result;
+        }
+        private Mat EdgeFilter(Mat src)
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+            using var edges = new Mat();
+            Cv2.Canny(gray, edges, 50, 150);
+            var result = new Mat(src.Size(), MatType.CV_8UC3, Scalar.Black);
+            result.SetTo(new Scalar(255, 255, 0), edges);
+            return result;
+        }
+
+        private Mat DuotoneFilter(Mat src, Scalar darkColor, Scalar lightColor)
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+
+            using var lutB = new Mat(1, 256, MatType.CV_8UC1);
+            using var lutG = new Mat(1, 256, MatType.CV_8UC1);
+            using var lutR = new Mat(1, 256, MatType.CV_8UC1);
+
+            for (int i = 0; i < 256; i++)
+            {
+                float t = i / 255f;
+                byte b = (byte)(darkColor.Val0 + (lightColor.Val0 - darkColor.Val0) * t);
+                byte g = (byte)(darkColor.Val1 + (lightColor.Val1 - darkColor.Val1) * t);
+                byte r = (byte)(darkColor.Val2 + (lightColor.Val2 - darkColor.Val2) * t);
+                lutB.Set(0, i, b);
+                lutG.Set(0, i, g);
+                lutR.Set(0, i, r);
+            }
+
+            using var channelB = new Mat();
+            using var channelG = new Mat();
+            using var channelR = new Mat();
+            Cv2.LUT(gray, lutB, channelB);
+            Cv2.LUT(gray, lutG, channelG);
+            Cv2.LUT(gray, lutR, channelR);
+
+            var result = new Mat();
+            Cv2.Merge(new[] { channelB, channelG, channelR }, result);
+            return result;
+        }
+
+        private Mat GrayscaleFilter(Mat src)
+        {
+            using var gray = new Mat();
+            Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+            var result = new Mat();
+            Cv2.CvtColor(gray, result, ColorConversionCodes.GRAY2BGR);
+            return result;
+        }
+
+        private Mat ApplyFilterEffect(Mat roi, int filterIndex)
+        {
+            switch (((filterIndex % 7) + 7) % 7)
+            {
+                case 0: return HeatmapFilter(roi);
+                case 1: return SketchFilter(roi);
+                case 2: return PrismFilter(roi);
+                case 3: return EdgeFilter(roi);
+                case 4: return DuotoneFilter(roi, new Scalar(180, 50, 220), new Scalar(0, 220, 255));
+                case 5: return GrayscaleFilter(roi);
+                case 6:
+                    {
+                        var inverted = new Mat();
+                        Cv2.BitwiseNot(roi, inverted);
+                        return inverted;
+                    }
+                default: return roi.Clone();
+            }
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)

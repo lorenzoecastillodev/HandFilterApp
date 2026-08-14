@@ -6,7 +6,9 @@
         xmlns:local="clr-namespace:HandFilterApp"
         mc:Ignorable="d"
         Title="Hand Filter App" Height="600" Width="900"
+        Background="Black"
         Closing="Window_Closing">
+    
     <Grid>
         <Image x:Name="CameraView"/>
     </Grid>
