@@ -21,8 +21,13 @@ namespace HandFilterApp
         private Task _detectionTask;
         private InferenceSession _palmDetector;
         private InferenceSession _landmarkDetector;
+        private int _currentFilterIndex = 0;
+        private bool _wasTouching = false;
+        private DateTime _lastGestureTime = DateTime.MinValue;
         private readonly object _landmarksLock = new object();
-        private OpenCvSharp.Point2f[] _lastLandmarks = null;
+        private List<OpenCvSharp.Point2f[]> _lastLandmarksList = new List<OpenCvSharp.Point2f[]>();
+        private readonly object _boxLock = new object();
+        private List<OpenCvSharp.Rect> _lastPalmBoxes = new List<OpenCvSharp.Rect>();
 
         public MainWindow()
         {
@@ -81,24 +86,26 @@ namespace HandFilterApp
                 frameCopy = _frame.Clone();
             }
 
-            OpenCvSharp.Rect? box;
-            lock (_boxLock) { box = _lastPalmBox; }
+            List<OpenCvSharp.Rect> boxes;
+            lock (_boxLock) { boxes = _lastPalmBoxes; }
 
-            if (box.HasValue)
+            foreach (var box in boxes)
             {
-                Cv2.Rectangle(frameCopy, box.Value, Scalar.LimeGreen, 3);
+                Cv2.Rectangle(frameCopy, box, Scalar.LimeGreen, 3);
             }
 
-            OpenCvSharp.Point2f[] landmarks;
-            lock (_landmarksLock) { landmarks = _lastLandmarks; }
+            List<OpenCvSharp.Point2f[]> landmarksList;
+            lock (_landmarksLock) { landmarksList = _lastLandmarksList; }
 
-            if (landmarks != null)
+            foreach (var landmarks in landmarksList)
             {
                 foreach (var pt in landmarks)
                 {
                     Cv2.Circle(frameCopy, (OpenCvSharp.Point)pt, 5, Scalar.Red, -1);
                 }
             }
+
+            ApplyFrameFilter(frameCopy, landmarksList);
 
             var bitmap = MatToBitmapSource(frameCopy);
             CameraView.Source = bitmap;
@@ -158,14 +165,16 @@ namespace HandFilterApp
             Cv2.CvtColor(padded, rgb, ColorConversionCodes.BGR2RGB);
 
             var tensor = new DenseTensor<float>(new[] { 1, 192, 192, 3 });
+            rgb.GetArray(out Vec3b[] pixels);
+            int idx = 0;
             for (int y = 0; y < 192; y++)
             {
                 for (int x = 0; x < 192; x++)
                 {
-                    var pixel = rgb.At<Vec3b>(y, x);
-                    tensor[0, y, x, 0] = pixel.Item0 / 255f;
-                    tensor[0, y, x, 1] = pixel.Item1 / 255f;
-                    tensor[0, y, x, 2] = pixel.Item2 / 255f;
+                    var p = pixels[idx++];
+                    tensor[0, y, x, 0] = p.Item0 / 255f;
+                    tensor[0, y, x, 1] = p.Item1 / 255f;
+                    tensor[0, y, x, 2] = p.Item2 / 255f;
                 }
             }
 
@@ -192,17 +201,19 @@ namespace HandFilterApp
                 {
                     DetectPalm(frameCopy);
 
-                    OpenCvSharp.Rect? box;
-                    lock (_boxLock) { box = _lastPalmBox; }
+                    List<OpenCvSharp.Rect> boxes;
+                    lock (_boxLock) { boxes = new List<OpenCvSharp.Rect>(_lastPalmBoxes); }
 
-                    if (box.HasValue)
+                    var landmarksList = new List<OpenCvSharp.Point2f[]>();
+                    foreach (var box in boxes)
                     {
-                        DetectLandmarks(frameCopy, box.Value);
+                        var pts = DetectLandmarks(frameCopy, box);
+                        if (pts != null) landmarksList.Add(pts);
                     }
-                    else
-                    {
-                        lock (_landmarksLock) { _lastLandmarks = null; }
-                    }
+
+                    lock (_landmarksLock) { _lastLandmarksList = landmarksList; }
+
+                    CheckGesture(landmarksList);
 
                     frameCopy.Dispose();
                 }
@@ -218,8 +229,13 @@ namespace HandFilterApp
             return 1f / (1f + (float)Math.Exp(-x));
         }
 
-        private readonly object _boxLock = new object();
-        private OpenCvSharp.Rect? _lastPalmBox = null;
+        private float IoU(OpenCvSharp.Rect a, OpenCvSharp.Rect b)
+        {
+            var inter = a & b;
+            float interArea = inter.Width * inter.Height;
+            float unionArea = (a.Width * a.Height) + (b.Width * b.Height) - interArea;
+            return unionArea <= 0 ? 0 : interArea / unionArea;
+        }
 
         private void DetectPalm(Mat frame)
         {
@@ -229,51 +245,57 @@ namespace HandFilterApp
         NamedOnnxValue.CreateFromTensor("input_1", inputTensor)
     };
 
+            var candidates = new List<(float score, OpenCvSharp.Rect box)>();
+
             using (var results = _palmDetector.Run(inputs))
             {
                 var boxes = results.First(r => r.Name == "Identity").AsTensor<float>();
                 var scores = results.First(r => r.Name == "Identity_1").AsTensor<float>();
 
-                int bestIndex = -1;
-                float bestScore = 0.5f;
-
                 for (int i = 0; i < scores.Length; i++)
                 {
                     float score = Sigmoid(scores.GetValue(i));
-                    if (score > bestScore)
-                    {
-                        bestScore = score;
-                        bestIndex = i;
-                    }
-                }
+                    if (score < 0.5f) continue;
 
-                if (bestIndex == -1)
+                    float dx = boxes[0, i, 0];
+                    float dy = boxes[0, i, 1];
+                    float dw = boxes[0, i, 2];
+                    float dh = boxes[0, i, 3];
+
+                    var anchor = _anchors[i];
+                    float cx = dx / 192f + anchor.x;
+                    float cy = dy / 192f + anchor.y;
+                    float w = dw / 192f;
+                    float h = dh / 192f;
+
+                    int x1 = (int)((cx - w / 2f) * scale - padLeft);
+                    int y1 = (int)((cy - h / 2f) * scale - padTop);
+                    int boxW = (int)(w * scale);
+                    int boxH = (int)(h * scale);
+
+                    candidates.Add((score, new OpenCvSharp.Rect(x1, y1, boxW, boxH)));
+                }
+            }
+
+            candidates.Sort((a, b) => b.score.CompareTo(a.score));
+
+            var finalBoxes = new List<OpenCvSharp.Rect>();
+            foreach (var c in candidates)
+            {
+                if (finalBoxes.Count >= 2) break;
+
+                bool overlaps = false;
+                foreach (var fb in finalBoxes)
                 {
-                    lock (_boxLock) { _lastPalmBox = null; }
-                    return;
+                    if (IoU(c.box, fb) > 0.3f) { overlaps = true; break; }
                 }
 
-                float dx = boxes[0, bestIndex, 0];
-                float dy = boxes[0, bestIndex, 1];
-                float dw = boxes[0, bestIndex, 2];
-                float dh = boxes[0, bestIndex, 3];
+                if (!overlaps) finalBoxes.Add(c.box);
+            }
 
-                var anchor = _anchors[bestIndex];
-
-                float cx = dx / 192f + anchor.x;
-                float cy = dy / 192f + anchor.y;
-                float w = dw / 192f;
-                float h = dh / 192f;
-
-                int x1 = (int)((cx - w / 2f) * scale - padLeft);
-                int y1 = (int)((cy - h / 2f) * scale - padTop);
-                int boxW = (int)(w * scale);
-                int boxH = (int)(h * scale);
-
-                lock (_boxLock)
-                {
-                    _lastPalmBox = new OpenCvSharp.Rect(x1, y1, boxW, boxH);
-                }
+            lock (_boxLock)
+            {
+                _lastPalmBoxes = finalBoxes;
             }
         }
 
@@ -319,7 +341,7 @@ namespace HandFilterApp
             return anchors;
         }
 
-        private void DetectLandmarks(Mat frame, OpenCvSharp.Rect palmBox)
+        private OpenCvSharp.Point2f[] DetectLandmarks(Mat frame, OpenCvSharp.Rect palmBox)
         {
             int centerX = palmBox.X + palmBox.Width / 2;
             int centerY = palmBox.Y + palmBox.Height / 2 - (int)(palmBox.Height * 0.1f);
@@ -333,23 +355,33 @@ namespace HandFilterApp
             int x2 = Math.Min(frame.Width, cropX + side);
             int y2 = Math.Min(frame.Height, cropY + side);
 
-            if (x2 - x1 <= 0 || y2 - y1 <= 0) return;
+            if (x2 - x1 <= 0 || y2 - y1 <= 0) return null;
 
-            using var cropped = new Mat(frame, new OpenCvSharp.Rect(x1, y1, x2 - x1, y2 - y1));
+            int padLeft = x1 - cropX;
+            int padTop = y1 - cropY;
+            int padRight = (cropX + side) - x2;
+            int padBottom = (cropY + side) - y2;
+
+            using var rawCrop = new Mat(frame, new OpenCvSharp.Rect(x1, y1, x2 - x1, y2 - y1));
+            using var cropped = new Mat();
+            Cv2.CopyMakeBorder(rawCrop, cropped, padTop, padBottom, padLeft, padRight, BorderTypes.Constant, Scalar.Black);
+
             using var rgb = new Mat();
             Cv2.CvtColor(cropped, rgb, ColorConversionCodes.BGR2RGB);
             using var resized = new Mat();
             Cv2.Resize(rgb, resized, new OpenCvSharp.Size(224, 224));
 
             var tensor = new DenseTensor<float>(new[] { 1, 224, 224, 3 });
+            resized.GetArray(out Vec3b[] pixels);
+            int idx = 0;
             for (int y = 0; y < 224; y++)
             {
                 for (int x = 0; x < 224; x++)
                 {
-                    var pixel = resized.At<Vec3b>(y, x);
-                    tensor[0, y, x, 0] = pixel.Item0 / 255f;
-                    tensor[0, y, x, 1] = pixel.Item1 / 255f;
-                    tensor[0, y, x, 2] = pixel.Item2 / 255f;
+                    var p = pixels[idx++];
+                    tensor[0, y, x, 0] = p.Item0 / 255f;
+                    tensor[0, y, x, 1] = p.Item1 / 255f;
+                    tensor[0, y, x, 2] = p.Item2 / 255f;
                 }
             }
 
@@ -363,27 +395,95 @@ namespace HandFilterApp
             float conf = results.First(r => r.Name == "Identity_1").AsTensor<float>().GetValue(0);
             if (conf < 0.5f)
             {
-                lock (_landmarksLock) { _lastLandmarks = null; }
-                return;
+                return null;
             }
 
             var raw = results.First(r => r.Name == "Identity").AsTensor<float>();
 
-            float scaleX = (float)(x2 - x1) / 224f;
-            float scaleY = (float)(y2 - y1) / 224f;
+            float scaleX = (float)side / 224f;
+            float scaleY = (float)side / 224f;
 
             var points = new OpenCvSharp.Point2f[21];
             for (int i = 0; i < 21; i++)
             {
                 float lx = raw[0, i * 3];
                 float ly = raw[0, i * 3 + 1];
-                points[i] = new OpenCvSharp.Point2f(lx * scaleX + x1, ly * scaleY + y1);
+                points[i] = new OpenCvSharp.Point2f(lx * scaleX + cropX, ly * scaleY + cropY);
             }
 
-            lock (_landmarksLock)
+            return points;
+        }
+
+        private void CheckGesture(List<OpenCvSharp.Point2f[]> landmarksList)
+        {
+            bool isTouching = false;
+
+            foreach (var landmarks in landmarksList)
             {
-                _lastLandmarks = points;
+                var thumbTip = landmarks[4];
+                var pinkyTip = landmarks[20];
+                var wrist = landmarks[0];
+                var middleBase = landmarks[9];
+
+                float handSize = Distance(wrist, middleBase);
+                float touchDistance = Distance(thumbTip, pinkyTip);
+
+                if (touchDistance < handSize * 0.4f)
+                {
+                    isTouching = true;
+                    break;
+                }
             }
+
+            if (isTouching && !_wasTouching)
+            {
+                if ((DateTime.Now - _lastGestureTime).TotalMilliseconds > 800)
+                {
+                    _currentFilterIndex++;
+                    _lastGestureTime = DateTime.Now;
+                    System.Diagnostics.Debug.WriteLine($"¡Gesto detectado! Filtro actual: {_currentFilterIndex}");
+                }
+            }
+
+            _wasTouching = isTouching;
+        }
+
+        private float Distance(OpenCvSharp.Point2f a, OpenCvSharp.Point2f b)
+        {
+            float dx = a.X - b.X;
+            float dy = a.Y - b.Y;
+            return (float)Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        private void ApplyFrameFilter(Mat frame, List<OpenCvSharp.Point2f[]> landmarksList)
+        {
+            if (landmarksList.Count < 2) return;
+
+            var hand1 = landmarksList[0];
+            var hand2 = landmarksList[1];
+
+            var (left, right) = hand1[0].X < hand2[0].X ? (hand1, hand2) : (hand2, hand1);
+
+            var indexLeft = left[8];
+            var indexRight = right[8];
+            var thumbRight = right[4];
+            var thumbLeft = left[4];
+
+            var quad = new[]
+            {
+        (OpenCvSharp.Point)indexLeft,
+        (OpenCvSharp.Point)indexRight,
+        (OpenCvSharp.Point)thumbRight,
+        (OpenCvSharp.Point)thumbLeft
+    };
+
+            using var mask = Mat.Zeros(frame.Size(), MatType.CV_8UC1).ToMat();
+            Cv2.FillConvexPoly(mask, quad, Scalar.White);
+
+            using var filtered = new Mat();
+            Cv2.BitwiseNot(frame, filtered);
+
+            filtered.CopyTo(frame, mask);
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
