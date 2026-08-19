@@ -4,7 +4,7 @@ Aplicación de escritorio en **C# (WPF)** que detecta las manos en tiempo real a
 
 ## 🎥 Demo
 
-https://github.com/user-attachments/assets/c0e20215-a001-4c01-9773-91f0da1d2bba
+https://github.com/user-attachments/assets/900f8c9f-f123-43a9-9e3c-b2b1b8928a35
 
 ## Características
 
